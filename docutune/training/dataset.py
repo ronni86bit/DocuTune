@@ -52,12 +52,21 @@ def build_features(tokenizer: Any, text: str, target: dict[str, Any],
 
 
 class SFTDataset:
-    """Torch dataset over a JSONL split. Import torch lazily."""
+    """Protocol-based map-style dataset over a JSONL split.
+
+    Implements __len__/__getitem__, which is the entire protocol
+    torch DataLoader and Hugging Face Trainer require - there is no need to
+    subclass torch.utils.data.Dataset (doing so would also drag a torch
+    import into this module's class definition). torch is imported lazily in
+    the constructor purely to validate availability early with a clear
+    error. as_torch_dataset() returns self: it previously tried to
+    INSTANTIATE torch.utils.data.Dataset(self.features), which fails with
+    "TypeError: Dataset() takes no arguments" (regression-tested).
+    """
 
     def __init__(self, jsonl_path: str, tokenizer: Any, max_length: int = 2048,
                  max_samples: int | None = None):
         import torch  # noqa: F401 - validates torch availability at construction
-        from torch.utils.data import Dataset  # noqa: F401
 
         from docutune.utils.io import read_jsonl
         from docutune.utils.logging import get_logger
@@ -69,7 +78,6 @@ class SFTDataset:
         self.tokenizer = tokenizer
         self.max_length = max_length
 
-        self._dataset_cls = Dataset
         self.features: list[dict[str, list[int]]] = []
         self.n_truncated = 0
         for row in self.rows:
@@ -89,5 +97,6 @@ class SFTDataset:
     def __getitem__(self, idx: int) -> dict[str, list[int]]:
         return self.features[idx]
 
-    def as_torch_dataset(self):
-        return self._dataset_cls(self.features)
+    def as_torch_dataset(self) -> SFTDataset:
+        """Return self: SFTDataset already satisfies the Trainer protocol."""
+        return self
