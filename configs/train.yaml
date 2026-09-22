@@ -1,0 +1,57 @@
+# DocuTune training configuration.
+# All important values are configurable; the Colab notebook and
+# docutune/training/train.py read this file.
+
+model:
+  name: microsoft/Phi-3-mini-4k-instruct
+  # Exact HF revision (branch / tag / commit sha). null = default revision.
+  # Recorded in the training manifest for reproducibility.
+  revision: null
+
+quantization:
+  # QLoRA: 4-bit NF4 with double quantization. Requires CUDA + bitsandbytes.
+  # Automatically disabled (with a logged warning) when running on CPU,
+  # e.g. for the smoke test.
+  enabled: true
+  bits: 4
+  quant_type: nf4
+  use_double_quant: true
+  # bfloat16 when supported by the GPU, else float16 (resolved at runtime).
+  compute_dtype: auto
+
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  # Verified against the actual model architecture at runtime.
+  # Training fails with an informative error listing the available modules
+  # if any requested module does not exist.
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+
+training:
+  output_dir: artifacts/training
+  final_adapter_dir: artifacts/adapters/final
+  epochs: 3
+  learning_rate: 2.0e-4
+  weight_decay: 0.01
+  warmup_ratio: 0.05
+  max_length: 2048
+  per_device_train_batch_size: 2
+  gradient_accumulation_steps: 8
+  gradient_checkpointing: true
+  eval_strategy: steps
+  eval_steps: 25
+  save_strategy: steps
+  save_steps: 25
+  logging_steps: 10
+  save_total_limit: 2
+  seed: 42
+
+data:
+  train_file: data/splits/train.jsonl
+  validation_file: data/splits/validation.jsonl
+  # The test split is deliberately NOT referenced anywhere in training.

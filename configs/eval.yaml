@@ -1,0 +1,26 @@
+# DocuTune evaluation / benchmark configuration.
+# The same prompt, generation settings, parser, normalization and evaluator
+# are used for BOTH the base model and the fine-tuned model (only the model
+# state differs). See docs/EVALUATION.md.
+
+model:
+  name: microsoft/Phi-3-mini-4k-instruct
+  revision: null
+
+adapter:
+  path: artifacts/adapters/final
+
+# Deterministic decoding - identical for base and fine-tuned evaluation.
+generation:
+  max_new_tokens: 700
+  do_sample: false
+  num_beams: 1
+
+evaluation:
+  test_file: data/splits/test.jsonl
+  baseline_predictions: results/baseline_predictions.jsonl
+  finetuned_predictions: results/finetuned_predictions.jsonl
+  bootstrap_samples: 1000
+  bootstrap_seed: 42
+  # Warm-up generations excluded from latency statistics.
+  warmup_examples: 3

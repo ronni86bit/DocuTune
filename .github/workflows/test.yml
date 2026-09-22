@@ -1,0 +1,52 @@
+name: tests
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        # Training extras (torch/transformers/peft) are intentionally NOT
+        # installed: CI must never download a 3B model or run GPU training.
+        # The package imports them lazily, so all tests pass without them.
+        run: pip install -e ".[serving,eval,dev]"
+      - name: Lint (ruff)
+        run: ruff check .
+      - name: Generate + validate dataset (small)
+        run: |
+          python scripts/generate_data.py --train 24 --validation 8 --test 8
+          python scripts/validate_data.py
+      - name: Verify project
+        run: python scripts/verify_project.py
+      - name: Tests
+        run: pytest -q
+
+  frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+      - name: Lint
+        run: npm run lint
+      - name: Production build
+        run: npm run build

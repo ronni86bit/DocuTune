@@ -1,0 +1,18 @@
+# Root build context is used for the backend image; keep it small.
+.git/
+.github/
+.venv/
+**/__pycache__/
+*.pyc
+.env
+data/
+results/
+artifacts/
+frontend/
+tests/
+docs/
+notebooks/
+scripts/
+*.egg-info/
+.ruff_cache/
+.pytest_cache/

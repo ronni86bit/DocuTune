@@ -1,0 +1,64 @@
+# DocuTune - full serving stack (training never runs here).
+#
+#   docker compose build
+#   docker compose up
+#
+#   Frontend:  http://localhost:3000
+#   Backend:   http://localhost:8000  (docs: /docs)
+#
+# The backend downloads/caches the base model from Hugging Face on first
+# start (cached in the named volume) and loads the LoRA adapter from the
+# mounted ./artifacts directory produced by the Colab training run.
+
+services:
+  backend:
+    build:
+      # Repo-root context: the image installs the docutune package itself.
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: docutune-backend
+    ports:
+      - "8000:8000"
+    environment:
+      BASE_MODEL: ${BASE_MODEL:-microsoft/Phi-3-mini-4k-instruct}
+      MODEL_REVISION: ${MODEL_REVISION:-}
+      # base | finetuned - default model for /api/extract
+      MODEL_MODE: ${MODEL_MODE:-finetuned}
+      ADAPTER_PATH: /app/artifacts/adapters/final
+      DEVICE: ${DEVICE:-auto}
+      QUANTIZED: ${QUANTIZED:-false}
+      MAX_NEW_TOKENS: ${MAX_NEW_TOKENS:-700}
+      MAX_INPUT_CHARS: ${MAX_INPUT_CHARS:-20000}
+      HF_TOKEN: ${HF_TOKEN:-}
+      LOG_LEVEL: INFO
+    volumes:
+      # Trained adapter (and training artifacts) from the Colab run.
+      - ./artifacts:/app/artifacts
+      # Benchmark results for the dashboard (read-only).
+      - ./results:/app/results:ro
+      # Persistent Hugging Face model cache.
+      - hf_cache:/app/hf-cache
+    restart: unless-stopped
+    # Optional GPU serving: requires the NVIDIA Container Toolkit
+    # (docs/DEPLOYMENT.md). Uncomment and set DEVICE=cuda, QUANTIZED=true.
+    #
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+  frontend:
+    build: ./frontend
+    container_name: docutune-frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  hf_cache:

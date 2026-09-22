@@ -1,0 +1,23 @@
+# DocuTune backend application defaults.
+# Every value can be overridden through environment variables (see .env.example);
+# environment variables always win over this file.
+
+server:
+  host: 0.0.0.0
+  port: 8000
+
+model:
+  # base | finetuned - default model served by /api/extract
+  mode: finetuned
+  base_model: microsoft/Phi-3-mini-4k-instruct
+  adapter_path: artifacts/adapters/final
+  device: auto
+  # 4-bit base model loading (CUDA only). CPU serving must use false.
+  quantized: false
+
+generation:
+  max_new_tokens: 700
+
+limits:
+  # API input safety (spec: reasonable maximum request size).
+  max_input_chars: 20000
