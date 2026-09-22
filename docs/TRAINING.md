@@ -46,11 +46,48 @@ data:
   validation_file: data/splits/validation.jsonl
 ```
 
-## Target-Module Safety
+## Warmup: ratio in config, steps for transformers
 
-`docutune/training/model.py::verify_target_modules` inspects the actual model's Linear
-submodules before constructing the LoRA. Unknown modules produce a hard error listing
-the available names — the configuration never silently trains nothing.
+Transformers 5.x removed `TrainingArguments(warmup_ratio=...)`. The YAML keeps
+expressing warmup as a ratio; `docutune/training/schedule.py` converts it into an
+exact `warmup_steps` value before `TrainingArguments` is constructed:
+
+```
+loader_steps_per_epoch = ceil(N_train / per_device_batch_size)
+update_steps_per_epoch = ceil(loader_steps / gradient_accumulation_steps)
+total_steps            = ceil(update_steps_per_epoch * epochs)   # or max_steps override
+warmup_steps           = clamp(ceil(warmup_ratio * total_steps), 0, total_steps)
+```
+
+This is robust to any dataset size, batch size, gradient-accumulation, epoch count and
+`max_steps` override (the smoke test uses 2 fixed steps → 1 warmup step). With the
+default 450-example dataset (batch 2 × accum 8 × 3 epochs = 87 steps), `warmup_ratio:
+0.05` becomes 5 warmup steps. The values are logged before training starts.
+
+## Target Modules: architecture-aware resolution
+
+`docutune/training/model.py::resolve_lora_target_modules` resolves the configured
+attention projections against the ACTUAL model architecture:
+
+| Requested (`configs/train.yaml`) | Architecture | Actually adapted |
+|---|---|---|
+| `q_proj, k_proj, v_proj, o_proj` | separate attention (Llama, Qwen, ...) | `q_proj, k_proj, v_proj, o_proj` |
+| `q_proj, k_proj, v_proj, o_proj` | fused attention (Phi-3) | `qkv_proj, o_proj` |
+
+- Phi-3 fuses the three input projections into one `qkv_proj` Linear; requesting the
+  canonical trio maps onto it automatically (only a complete trio is aliased — partial
+  requests fail rather than guess).
+- **Nothing is silently skipped.** Any requested module that resolves neither exactly
+  nor via alias aborts training with an error listing the model's real Linear names;
+  an empty resolved set is impossible.
+- The resolved set is logged before training and recorded as `target_modules` in
+  `artifacts/training/training_manifest.json` (the raw request is kept as
+  `target_modules_requested`).
+- **Why not PEFT's `target_modules="all-linear"`?** Evaluated and deliberately not
+  used: it would also adapt the MLP projections (gate/up/down), changing the
+  trainable-parameter surface and thus the meaning of the experiment. Attention-only
+  adapters are the intended design; the explicit request + alias table keeps that
+  design while supporting both fused and separate attention architectures.
 
 ## Loss Masking (completion-only)
 
@@ -72,7 +109,7 @@ python -m docutune.training.train --max-samples 16                      # debug
 
 Pipeline steps executed: environment validation → seeds → tokenizer → CUDA/GPU
 detection → quantization config → k-bit preparation → LoRA construction → target-module
-verification → dataset tokenization (train/validation ONLY — the test split is never
+resolution → dataset tokenization (train/validation ONLY — the test split is never
 read here) → training → validation evaluation → adapter save → tokenizer save → resolved
 config save → loss history → training manifest.
 
@@ -111,7 +148,8 @@ No GPU information is ever invented; on CPU those fields are null/false.
 
 | Symptom | Cause / fix |
 |---|---|
-| `None of the requested LoRA target modules exist...` | different base model → update `lora.target_modules` (error lists valid names) |
+| `Requested LoRA target modules do not exist... Unresolved: [...]` | different base model → update `lora.target_modules` (error lists the model's real Linear names) |
+| `TrainingArguments got an unexpected keyword argument 'warmup_ratio'` | transformers 5.x removed it — fixed in this repo (ratio → `warmup_steps` conversion); update to the latest code |
 | `Quantization requires bitsandbytes` | install training extras or set `quantization.enabled: false` (not QLoRA then) |
 | CUDA OOM | reduce `max_length` or `per_device_train_batch_size`, or increase `gradient_accumulation_steps` |
 | Colab disconnected | re-run with `--resume` (same output dir) |

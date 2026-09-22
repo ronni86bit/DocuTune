@@ -23,9 +23,18 @@ lora:
   r: 16
   alpha: 32
   dropout: 0.05
-  # Verified against the actual model architecture at runtime.
-  # Training fails with an informative error listing the available modules
-  # if any requested module does not exist.
+  # Canonical, architecture-agnostic attention request. Resolved against the
+  # ACTUAL model at runtime (docutune/training/model.py):
+  #   - separate attention (e.g. Llama)  -> q_proj, k_proj, v_proj, o_proj
+  #   - fused attention (e.g. Phi-3)     -> qkv_proj, o_proj
+  # The resolved set is logged and recorded as `target_modules` in the
+  # training manifest; any request that cannot be resolved FAILS training
+  # (modules are never silently skipped).
+  #
+  # Design note: PEFT's target_modules="all-linear" was evaluated and
+  # deliberately NOT used - it would also adapt the MLP projections
+  # (gate/up/down), changing the trainable-parameter surface and the
+  # experiment's meaning. Attention-only adapters remain the intended design.
   target_modules:
     - q_proj
     - k_proj
@@ -38,6 +47,10 @@ training:
   epochs: 3
   learning_rate: 2.0e-4
   weight_decay: 0.01
+  # Expressed as a RATIO of total optimizer steps (readable, size-independent).
+  # Transformers 5.x removed TrainingArguments(warmup_ratio=...), so the
+  # trainer converts this into an exact warmup_steps value from the actual
+  # computed step count (see docutune/training/schedule.py).
   warmup_ratio: 0.05
   max_length: 2048
   per_device_train_batch_size: 2

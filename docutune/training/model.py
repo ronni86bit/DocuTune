@@ -29,30 +29,68 @@ def list_linear_module_names(model: Any) -> list[str]:
     return sorted(names)
 
 
-def verify_target_modules(model: Any, requested: list[str]) -> list[str]:
-    """Return requested modules that exist in the model; raise otherwise.
+def resolve_lora_target_modules(model: Any, requested: list[str]) -> list[str]:
+    """Resolve requested LoRA target modules against the ACTUAL architecture.
 
-    Matches either full submodule paths or final path components, and only
-    counts modules that are Linear layers (valid LoRA targets).
+    Resolution rules (in order):
+      1. Exact match against the model's Linear submodules (matched by name or
+         by final path component, e.g. "o_proj" ~ "...self_attn.o_proj").
+      2. Fused-QKV aliasing - architectures fuse the three attention input
+         projections into one Linear, others keep them separate:
+           - request {q_proj, k_proj, v_proj} + model has ``qkv_proj``
+             (e.g. Phi-3) -> adapt ``qkv_proj``
+           - request ``qkv_proj`` + model has separate q/k/v -> adapt all three
+         Only a complete trio is aliased, so a partially-specified request
+         still fails loudly instead of guessing.
+
+    Fails LOUDLY (ValueError) when:
+      - any requested module resolves neither exactly nor via alias
+        (no silent skipping - a skipped attention projection silently
+        shrinks the adaptation and invalidates the experiment);
+      - the resolved set is empty.
+
+    Returns the sorted list of module names that will actually be adapted;
+    this is what gets logged and recorded in the training manifest.
     """
     available = set(list_linear_module_names(model))
-    verified: list[str] = []
-    missing: list[str] = []
-    for target in requested:
-        if target in available:
-            verified.append(target)
-        else:
-            missing.append(target)
-    if not verified:
+    requested = list(dict.fromkeys(requested))
+    resolved = {name for name in requested if name in available}
+    unmatched = [name for name in requested if name not in resolved]
+
+    qkv_trio = ("q_proj", "k_proj", "v_proj")
+    # Phi-3 style: q/k/v requested, fused qkv_proj present.
+    trio_requested = set(qkv_trio).issubset(requested)
+    if set(unmatched) & set(qkv_trio) and "qkv_proj" in available and trio_requested:
+        resolved.add("qkv_proj")
+        unmatched = [name for name in unmatched if name not in qkv_trio]
+        logger.info("Fused attention detected: q/k/v requests mapped to the fused 'qkv_proj' layer")
+    # Llama-style: fused qkv_proj requested, separate projections present.
+    if "qkv_proj" in unmatched:
+        separate = [name for name in qkv_trio if name in available]
+        if separate:
+            resolved.update(separate)
+            unmatched.remove("qkv_proj")
+            logger.info(
+                "Separate attention projections detected: fused request mapped to %s", separate
+            )
+
+    if unmatched:
         raise ValueError(
-            "None of the requested LoRA target modules exist in this model. "
-            f"Requested: {requested}. "
+            f"Requested LoRA target modules do not exist in this model and no "
+            f"architecture alias applies. Requested: {requested}. Unresolved: {unmatched}. "
             f"Available Linear module names include: {sorted(available)[:40]}. "
-            "Update lora.target_modules in configs/train.yaml for the selected model."
+            f"Update lora.target_modules in configs/train.yaml for the selected model "
+            f"(never leave attention projections silently unadapted)."
         )
-    if missing:
-        logger.warning("Requested LoRA target modules not found (skipped): %s", missing)
-    return verified
+    if not resolved:
+        raise ValueError(
+            "LoRA target-module resolution produced an EMPTY set - refusing to "
+            "train an adapter that adapts nothing. Requested: "
+            f"{requested}. Available Linear module names include: {sorted(available)[:40]}."
+        )
+    ordered = sorted(resolved)
+    logger.info("LoRA target modules (actually adapted): %s", ordered)
+    return ordered
 
 
 def resolve_compute_dtype(device: str):
@@ -136,20 +174,24 @@ def load_training_model(cfg: TrainConfig, device: str) -> tuple[Any, Any]:
     return model
 
 
-def attach_lora(model: Any, cfg: TrainConfig) -> Any:
-    """Verify target modules, attach LoRA, and report trainable parameters."""
+def attach_lora(model: Any, cfg: TrainConfig) -> tuple[Any, list[str]]:
+    """Resolve target modules against the real architecture, attach LoRA.
+
+    Returns (peft_model, resolved_modules) - the resolved list is what the
+    caller must record in the training manifest (exactly which projections
+    are adapted, e.g. qkv_proj + o_proj on Phi-3).
+    """
     from peft import LoraConfig, get_peft_model
 
-    verified = verify_target_modules(model, cfg.lora.target_modules)
-    logger.info("LoRA target modules (verified): %s", verified)
+    resolved = resolve_lora_target_modules(model, cfg.lora.target_modules)
     lora_config = LoraConfig(
         r=cfg.lora.r,
         lora_alpha=cfg.lora.alpha,
         lora_dropout=cfg.lora.dropout,
-        target_modules=verified,
+        target_modules=resolved,
         bias="none",
         task_type="CAUSAL_LM",
     )
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
-    return model
+    return model, resolved

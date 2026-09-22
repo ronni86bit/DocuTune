@@ -126,7 +126,7 @@ Canonical structured records are generated first, then rendered into messy text 
 ## Fine-Tuning
 
 - **Method:** QLoRA — frozen base in 4-bit NF4 (double quant), trainable LoRA adapters on `q_proj/k_proj/v_proj/o_proj` (verified against the actual architecture before training starts; training fails with an informative listing if modules don't exist).
-- **Config:** `r=16, alpha=32, dropout=0.05`, 3 epochs, LR 2e-4, effective batch 16 (2 × 8 accumulation), max_length 2048 — all in `configs/train.yaml`.
+- **Config:** `r=16, alpha=32, dropout=0.05`, 3 epochs, LR 2e-4, effective batch 16 (2 × 8 accumulation), max_length 2048, warmup_ratio 0.05 (→ warmup_steps computed automatically) — all in `configs/train.yaml`.
 - **Loss:** completion-only — prompt tokens are masked to `-100`; the model learns only the target JSON.
 - **Output:** a LoRA adapter (`artifacts/adapters/final`), a tokenizer copy, a resolved config, a loss history and a full training manifest with real versions (model revision, CUDA/GPU info, library versions, timing). See [`docs/TRAINING.md`](docs/TRAINING.md).
 - **Checkpointing:** `--resume` / `--checkpoint` recover interrupted Colab runs from the latest checkpoint.

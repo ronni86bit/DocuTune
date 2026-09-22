@@ -28,6 +28,7 @@ from docutune.config import (
     project_path,
 )
 from docutune.seed import set_seeds
+from docutune.training.schedule import compute_total_update_steps, compute_warmup_steps
 from docutune.utils.io import read_jsonl, write_json
 from docutune.utils.logging import get_logger
 
@@ -112,35 +113,79 @@ def validate_environment(config: TrainConfig) -> dict[str, Any]:
     return env
 
 
-def _training_arguments(config: TrainConfig, output_dir: Path, bf16: bool):
+def build_training_arguments(
+    config: TrainConfig,
+    output_dir: Path,
+    num_train_examples: int,
+    bf16: bool = False,
+    smoke_test: bool = False,
+):
+    """Construct TrainingArguments against the INSTALLED transformers version.
+
+    Compatibility notes (transformers 5.x):
+    - ``warmup_ratio`` was REMOVED. The YAML keeps ``warmup_ratio: 0.05``;
+      it is converted here into an exact ``warmup_steps`` value based on the
+      actual number of optimizer steps (docutune/training/schedule.py).
+    - ``save_safetensors`` was REMOVED (safetensors is the only format now).
+    """
+    import inspect
+
     from transformers import TrainingArguments
 
     hp = config.training
-    return TrainingArguments(
+    override_max_steps = 2 if smoke_test else 0
+    total_steps = compute_total_update_steps(
+        num_train_examples=num_train_examples,
+        per_device_train_batch_size=hp.per_device_train_batch_size,
+        gradient_accumulation_steps=hp.gradient_accumulation_steps,
+        num_epochs=hp.epochs,
+        override_max_steps=override_max_steps,
+    )
+    warmup_steps = compute_warmup_steps(hp.warmup_ratio, total_steps)
+    logger.info(
+        "Schedule: %d optimizer steps total, %d warmup steps (from warmup_ratio=%s)",
+        total_steps, warmup_steps, hp.warmup_ratio,
+    )
+
+    params = inspect.signature(TrainingArguments.__init__).parameters
+    if "warmup_steps" not in params:
+        raise RuntimeError(
+            "Installed transformers has no TrainingArguments(warmup_steps=...). "
+            "Adapt docutune/training/schedule.py + build_training_arguments for "
+            f"this version (transformers {software_versions().get('transformers_version')})."
+        )
+
+    kwargs: dict[str, Any] = dict(
         output_dir=str(output_dir),
-        num_train_epochs=hp.epochs,
         learning_rate=hp.learning_rate,
         weight_decay=hp.weight_decay,
-        warmup_ratio=hp.warmup_ratio,
+        warmup_steps=warmup_steps,
         per_device_train_batch_size=hp.per_device_train_batch_size,
         gradient_accumulation_steps=hp.gradient_accumulation_steps,
         gradient_checkpointing=hp.gradient_checkpointing,
         gradient_checkpointing_kwargs={"use_reentrant": False},
-        eval_strategy=hp.eval_strategy,
-        eval_steps=hp.eval_steps,
-        save_strategy=hp.save_strategy,
-        save_steps=hp.save_steps,
-        save_total_limit=hp.save_total_limit,
         logging_steps=hp.logging_steps,
         lr_scheduler_type="linear",
         bf16=bf16,
         seed=hp.seed,
         data_seed=hp.seed,
         report_to=[],
-        save_safetensors=True,
         load_best_model_at_end=False,
         remove_unused_columns=False,
     )
+    if smoke_test:
+        # Tiny run: fixed 2 steps, no periodic eval/checkpointing.
+        kwargs["max_steps"] = total_steps
+        kwargs["eval_strategy"] = "no"
+        kwargs["save_strategy"] = "no"
+    else:
+        kwargs["num_train_epochs"] = hp.epochs
+        kwargs["eval_strategy"] = hp.eval_strategy
+        kwargs["eval_steps"] = hp.eval_steps
+        kwargs["save_strategy"] = hp.save_strategy
+        kwargs["save_steps"] = hp.save_steps
+        kwargs["save_total_limit"] = hp.save_total_limit
+    return TrainingArguments(**kwargs)
 
 
 def run_training(config: TrainConfig, args: argparse.Namespace) -> Path:
@@ -169,7 +214,7 @@ def run_training(config: TrainConfig, args: argparse.Namespace) -> Path:
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         if hasattr(model, "enable_input_require_grads"):
             model.enable_input_require_grads()
-    model = attach_lora(model, config)  # 8-10 LoRA + target module verification
+    model, resolved_modules = attach_lora(model, config)  # 8-10 LoRA + target-module resolution
 
     train_file = project_path(config.data.train_file)
     val_file = project_path(config.data.validation_file)
@@ -189,14 +234,13 @@ def run_training(config: TrainConfig, args: argparse.Namespace) -> Path:
     from transformers import DataCollatorForSeq2Seq, Trainer
 
     collator = DataCollatorForSeq2Seq(tokenizer, padding=True, label_pad_token_id=-100)
-    training_args = _training_arguments(
-        config, output_dir, bf16=(device == "cuda" and env.get("torch_version", "").startswith("2"))
+    training_args = build_training_arguments(
+        config,
+        output_dir,
+        num_train_examples=len(train_dataset),
+        bf16=(device == "cuda" and env.get("torch_version", "").startswith("2")),
+        smoke_test=args.smoke_test,
     )
-    if args.smoke_test:
-        training_args.max_steps = 2
-        training_args.eval_strategy = "no"
-        training_args.save_strategy = "no"
-        training_args.eval_steps = 500
 
     trainer = Trainer(
         model=model,
@@ -234,7 +278,11 @@ def run_training(config: TrainConfig, args: argparse.Namespace) -> Path:
     config_copy = dict(
         model={"name": config.model.name, "revision": config.model.revision},
         quantization=vars(config.quantization),
-        lora={**vars(config.lora), "target_modules": config.lora.target_modules},
+        lora={
+            **vars(config.lora),
+            "target_modules_requested": config.lora.target_modules,
+            "target_modules_resolved": resolved_modules,
+        },
         training={**vars(config.training)},
         data=vars(config.data),
     )
@@ -264,7 +312,8 @@ def run_training(config: TrainConfig, args: argparse.Namespace) -> Path:
         "lora_r": config.lora.r,
         "lora_alpha": config.lora.alpha,
         "lora_dropout": config.lora.dropout,
-        "target_modules": config.lora.target_modules,
+        "target_modules_requested": config.lora.target_modules,
+        "target_modules": resolved_modules,
         "quantization": {
             "enabled": config.quantization.enabled and device == "cuda",
             "bits": config.quantization.bits,
@@ -283,6 +332,50 @@ def run_training(config: TrainConfig, args: argparse.Namespace) -> Path:
     write_json(final_adapter_dir / "training_manifest.json", manifest)
     logger.info("Training manifest written; total duration %.1fs", manifest["duration_seconds"])
     return final_adapter_dir
+
+
+def _resolve_against_real_phi3(config: TrainConfig) -> list[str]:
+    """Resolve configured target modules against a real Phi3Attention module.
+
+    Builds the actual `Phi3Attention` layer from the installed transformers
+    (random-initialized, no weights download) so the resolution is verified
+    against the true architecture naming (fused qkv_proj + o_proj), not a
+    stub. Falls back to a hand-built fused-attention stub only if the local
+    transformers does not ship the phi3 module.
+    """
+    import torch.nn as nn
+
+    from docutune.training.model import resolve_lora_target_modules
+
+    try:
+        from transformers.models.phi3 import modeling_phi3
+
+        attention = modeling_phi3.Phi3Attention(
+            modeling_phi3.Phi3Config(hidden_size=32, num_attention_heads=4,
+                                     num_key_value_heads=2),
+            layer_idx=0,
+        )
+        source = f"real Phi3Attention from transformers {modeling_phi3.__name__}"
+    except Exception as exc:  # noqa: BLE001 - fall back to an equivalent stub
+        logger.warning("Could not build Phi3Attention (%s); using an equivalent stub", exc)
+
+        class _Phi3LikeAttention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.qkv_proj = nn.Linear(32, 96)
+                self.o_proj = nn.Linear(32, 32)
+
+        attention = _Phi3LikeAttention()
+        source = "equivalent fused-attention stub"
+
+    resolved = resolve_lora_target_modules(attention, config.lora.target_modules)
+    logger.info("Resolved against %s -> %s", source, resolved)
+    if "qkv_proj" not in resolved or "o_proj" not in resolved:
+        raise RuntimeError(
+            f"Phi-3 target resolution unexpected: {resolved} "
+            "(expected the fused qkv_proj and o_proj to be adapted)"
+        )
+    return resolved
 
 
 def run_smoke_test(config: TrainConfig, args: argparse.Namespace) -> int:
@@ -324,24 +417,15 @@ def run_smoke_test(config: TrainConfig, args: argparse.Namespace) -> int:
     else:
         logger.info(
             "No CUDA device - skipping model construction and training steps. "
-            "Everything else (imports, config, tokenizer, tokenization, masking) validated."
+            "Everything else (imports, config, tokenizer, tokenization, masking, "
+            "target-module resolution) validated."
         )
-        # Validate the LoRA target-module verification logic structurally,
-        # using tiny real nn.Linear layers (no model weights involved).
-        import torch.nn as nn
+        # Resolve the configured target modules against the REAL Phi-3
+        # attention module from the installed transformers (tiny random
+        # weights, no download - the class constructor builds its Linears).
 
-        from docutune.training.model import verify_target_modules
-
-        class _StubModel:
-            def named_modules(self):
-                return iter([
-                    ("model.layers.0.self_attn.q_proj", nn.Linear(8, 8)),
-                    ("model.layers.0.self_attn.k_proj", nn.Linear(8, 8)),
-                    ("model.layers.0.mlp.up_proj", nn.Linear(8, 8)),
-                ])
-
-        verified = verify_target_modules(_StubModel(), ["q_proj", "k_proj"])
-        logger.info("Target-module verification logic OK (verified=%s on stub)", verified)
+        resolved = _resolve_against_real_phi3(config)
+        logger.info("Phi-3 target-module resolution OK (resolved=%s)", resolved)
         logger.info("SMOKE TEST PASSED (CPU mode; real training steps require a GPU)")
 
     import tempfile

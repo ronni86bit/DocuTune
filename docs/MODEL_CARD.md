@@ -7,8 +7,12 @@
 - **Base model revision:** recorded in `artifacts/training/training_manifest.json` and
   `results/benchmark_manifest.json` for every real run (never assumed)
 - **Fine-tuning method:** QLoRA (4-bit NF4 quantized frozen base + trainable low-rank adapters)
-- **LoRA configuration:** r=16, alpha=32, dropout=0.05, targets q_proj/k_proj/v_proj/o_proj
-  (verified against the model architecture at runtime)
+- **LoRA configuration:** r=16, alpha=32, dropout=0.05, attention-only targets. The
+  request `q_proj/k_proj/v_proj/o_proj` is resolved against the real architecture at
+  runtime: on Phi-3 (fused attention) the adapter trains on `qkv_proj` + `o_proj`;
+  on separate-attention architectures it trains on `q_proj, k_proj, v_proj, o_proj`.
+  The resolved set is logged and recorded as `target_modules` in the training
+  manifest.
 - **Serving form:** base model + adapter (merged weights are optional; `scripts/merge_adapter.py`)
 
 ## Purpose
