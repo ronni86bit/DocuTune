@@ -10,6 +10,11 @@ import pytest
 from docutune.training.model import resolve_lora_target_modules
 from docutune.training.schedule import compute_warmup_steps
 
+# Every test in this module needs torch: the stub models build real
+# nn.Linear layers and the integration tests build real Phi-3 modules.
+# CI installs no training extras, so skip the whole module there.
+pytest.importorskip("torch", reason="stub/real models require torch")
+
 DEFAULT_REQUEST = ["q_proj", "k_proj", "v_proj", "o_proj"]
 
 
