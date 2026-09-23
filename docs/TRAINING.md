@@ -124,13 +124,89 @@ config save → loss history → training manifest.
 `python scripts/check_environment.py` reports the actual environment (never fabricated):
 Python, torch, CUDA availability/version, GPU name and VRAM.
 
-## Checkpointing & Resume
+## Checkpointing & Resume (hardened for remote runtimes)
 
-- `save_strategy: steps` (every 25 steps) with `save_total_limit: 2`
-- `--resume` finds the latest checkpoint in the output dir; `--checkpoint <path>`
-  resumes from an explicit checkpoint
-- Interrupted Colab sessions: re-run the training cell with `--resume` — completed
-  checkpoints are reused, not overwritten
+**Periodic saving.** `save_strategy: steps` writes a full Trainer checkpoint every
+25 optimizer steps (`save_steps: 25`, `save_total_limit: 2`). Each checkpoint
+directory (`artifacts/training/checkpoint-<step>/`) contains adapter weights,
+`optimizer.pt`, `scheduler.pt`, `trainer_state.json` (step counter + log history)
+and RNG state — everything needed to continue optimizer/scheduler/model/Trainer
+state exactly where the run stopped. For the reference 87-step run (~6 h 20 m on
+a P100) that is a checkpoint roughly every 1 h 48 m: worst-case loss on a
+disconnect stays under two hours while retained storage stays around a few
+hundred MB. Checkpoints live under the **training output dir** and are never
+mixed with the final adapter directory.
+
+**Resume.**
+
+```bash
+python -m docutune.training.train --config configs/train.yaml --resume
+python -m docutune.training.train --checkpoint artifacts/training/checkpoint-50
+```
+
+- `--resume` uses `docutune/training/checkpoints.py::find_latest_valid_checkpoint`
+  to select the highest-step checkpoint that is **actually complete**
+  (`trainer_state.json` parseable + `optimizer.pt` + `scheduler.pt` + adapter
+  weights present). A directory killed mid-write is detected and skipped, so a
+  crash can never poison the resume. No valid checkpoint exists → the run
+  starts fresh (logged explicitly), which is the correct behavior on a first run.
+- `--checkpoint <path>` resumes from an explicit directory and **fails loudly**
+  if that directory is not a valid resume point.
+- The checkpoint path actually resumed from is recorded in the training manifest
+  (`resumed_from_checkpoint`).
+
+Kaggle-specific instructions (secrets, upload, both recovery cases):
+[docs/KAGGLE.md](KAGGLE.md).
+
+## Optional adapter persistence to the Hugging Face Hub
+
+On ephemeral runtimes the locally saved adapter dies with the runtime. After
+saving and **verifying** the final adapter, the trainer can upload it to a
+PRIVATE Hub repository. Controlled purely by environment variables:
+
+| Variable | Effect |
+|---|---|
+| `DOCUTUNE_HF_REPO_ID` | setting it (e.g. `you/docutune-phi3-adapter`) **enables** auto-upload; unset = upload disabled, fully local training |
+| `DOCUTUNE_HF_TOKEN` | write-enabled token; falls back to `HF_TOKEN` |
+
+Behavior (`docutune/training/persistence.py`):
+
+- the trainer verifies the saved adapter first (`adapter_config.json`, adapter
+  weights, tokenizer files) — an incomplete adapter is **not** uploaded;
+- the upload includes the adapter **plus its reproduction metadata**:
+  `training_manifest.json` and `resolved_training_config.json` live in the same
+  directory and are part of the upload;
+- the repo is created **private** if it does not exist;
+- outcome is logged and recorded in the training manifest
+  (`artifact_upload.status`: `disabled` / `succeeded` / `failed`; a smoke test
+  records `skipped (smoke test)`) — a failed upload is reported as failed, never
+  as success, and never touches the locally saved adapter;
+- the token is never printed; exception text is redacted before logging.
+
+Local training requires **no** Hugging Face authentication.
+
+## Intermediate validation evaluation (why it exists)
+
+`eval_strategy: steps`, `eval_steps: 25` → evaluation runs right before each
+checkpoint save (steps 25/50/75 in an 87-step run — the three ~6–7-minute
+evaluations observed on the P100). These evaluations are **not required by the
+project specification** (the original spec fixes `save_strategy`, not
+`eval_strategy`); they were added as diagnostics. They are kept in the default
+configuration because:
+
+1. they are the only in-run overfitting signal during a long *unattended*
+   remote run, and each checkpoint's `trainer_state.json` then contains a
+   fresh validation loss at the resume point;
+2. they are cheap relative to the run (~20 min of ~6 h 20 m, ≈5%) — evaluation
+   performs no optimizer updates and consumes no training RNG (sequential eval
+   sampler, model in eval mode), so they do not change the learned weights or
+   the final held-out benchmark in any way;
+3. removing them is a one-line config change (`eval_strategy: no` in
+   `configs/train.yaml`) left to the operator; the final full validation
+   evaluation recorded in the manifest and the held-out benchmark are
+   unaffected either way.
+
+No methodology or benchmark parameter was changed for speed.
 
 ## Artifacts
 
@@ -141,8 +217,9 @@ Python, torch, CUDA availability/version, GPU name and VRAM.
 
 The manifest records **actual** values only: model name/revision, dataset/prompt/schema
 versions, sizes, hyperparameters, LoRA config, quantization, Python/torch/transformers/
-peft/bitsandbytes/accelerate versions, CUDA version, GPU name/memory, start/end time.
-No GPU information is ever invented; on CPU those fields are null/false.
+peft/bitsandbytes/accelerate versions, CUDA version, GPU name/memory, start/end time,
+the checkpoint resumed from (if any) and the adapter upload status. No GPU
+information is ever invented; on CPU those fields are null/false.
 
 ## Troubleshooting
 
@@ -152,9 +229,11 @@ No GPU information is ever invented; on CPU those fields are null/false.
 | `TrainingArguments got an unexpected keyword argument 'warmup_ratio'` | transformers 5.x removed it — fixed in this repo (ratio → `warmup_steps` conversion); update to the latest code |
 | `Quantization requires bitsandbytes` | install training extras or set `quantization.enabled: false` (not QLoRA then) |
 | CUDA OOM | reduce `max_length` or `per_device_train_batch_size`, or increase `gradient_accumulation_steps` |
-| Colab disconnected | re-run with `--resume` (same output dir) |
+| Colab/Kaggle disconnected | re-run with `--resume` (same output dir) — resumes from the latest **valid** checkpoint |
+| `Explicit checkpoint ... is not a valid resume point` | the named checkpoint is incomplete; use `--resume` to auto-discover the latest valid one |
+| `Adapter upload FAILED: ...` | see the logged reason (token missing, repo permission, network). The local adapter is intact; fix and re-upload with `scripts/push_adapter.py`, or re-run training |
 | `data/splits/train.jsonl not found` | `python scripts/generate_data.py` first |
-| Adapter missing for serving | copy `artifacts/adapters/final` from Colab; set `ADAPTER_PATH` |
+| Adapter missing for serving | copy `artifacts/adapters/final` from the GPU runtime / HF repo; set `ADAPTER_PATH` |
 
 ## Training vs. Serving
 

@@ -28,6 +28,11 @@ from docutune.config import (
     project_path,
 )
 from docutune.seed import set_seeds
+from docutune.training.checkpoints import (
+    find_latest_valid_checkpoint,
+    validate_checkpoint_dir,
+)
+from docutune.training.persistence import persist_adapter, resolve_upload_settings
 from docutune.training.schedule import compute_total_update_steps, compute_warmup_steps
 from docutune.utils.io import read_jsonl, write_json
 from docutune.utils.logging import get_logger
@@ -254,11 +259,27 @@ def run_training(config: TrainConfig, args: argparse.Namespace) -> Path:
     # 16 train (with checkpoint resume support)
     resume_from = None
     if args.checkpoint:
-        resume_from = args.checkpoint
+        explicit = Path(args.checkpoint)
+        valid, problems = validate_checkpoint_dir(explicit)
+        if not valid:
+            raise RuntimeError(
+                f"Explicit checkpoint {explicit} is not a valid resume point: "
+                f"{problems}. Use --resume to auto-discover the latest valid "
+                "checkpoint instead."
+            )
+        resume_from = str(explicit)
         logger.info("Resuming from explicit checkpoint: %s", resume_from)
     elif args.resume:
-        resume_from = True  # Trainer finds the latest checkpoint in output_dir
-        logger.info("Resuming from the latest checkpoint in %s", output_dir)
+        latest = find_latest_valid_checkpoint(output_dir)
+        if latest is not None:
+            resume_from = str(latest)
+            logger.info("Resuming from the latest valid checkpoint: %s", resume_from)
+        else:
+            resume_from = None
+            logger.warning(
+                "No valid checkpoint found in %s - training from scratch "
+                "(incomplete checkpoints are ignored)", output_dir,
+            )
     trainer.train(resume_from_checkpoint=resume_from)
 
     # 17 validation evaluation
@@ -321,6 +342,7 @@ def run_training(config: TrainConfig, args: argparse.Namespace) -> Path:
             "use_double_quant": config.quantization.use_double_quant,
         },
         "smoke_test": bool(args.smoke_test),
+        "resumed_from_checkpoint": resume_from,
         "device": device,
         **{k: v for k, v in env.items() if k != "device"},
         "eval_metrics": eval_metrics,
@@ -328,6 +350,37 @@ def run_training(config: TrainConfig, args: argparse.Namespace) -> Path:
         "end_time": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "duration_seconds": round(time.time() - started, 1),
     }
+
+    # Write the manifest into the adapter directory BEFORE persistence so the
+    # uploaded artifact always contains the reproduction metadata (the final
+    # local copies below additionally record the upload status).
+    write_json(final_adapter_dir / "training_manifest.json", manifest)
+
+    # Optional persistence: push the verified adapter (+ manifest + resolved
+    # config, which live in the same directory) to a private HF repo. Local
+    # files are never modified by this step; failures are reported honestly.
+    if args.smoke_test:
+        upload_result = {"status": "skipped (smoke test)", "repo_id": None,
+                         "url": None, "reason": None}
+        logger.info("Smoke test - adapter upload skipped")
+    else:
+        settings = resolve_upload_settings()
+        if not settings.enabled:
+            logger.info(
+                "Adapter upload DISABLED (%s). The adapter is saved locally at %s "
+                "- copy it off the runtime manually, or set DOCUTUNE_HF_REPO_ID "
+                "(+ DOCUTUNE_HF_TOKEN / HF_TOKEN) to enable automatic upload.",
+                settings.reason, final_adapter_dir,
+            )
+        else:
+            logger.info("Adapter upload ENABLED -> private repo %s", settings.repo_id)
+        upload_result = persist_adapter(final_adapter_dir, settings)
+        if upload_result["status"] == "succeeded":
+            logger.info("Adapter upload SUCCEEDED: %s", upload_result["url"])
+        elif upload_result["status"] == "failed":
+            logger.error("Adapter upload FAILED: %s", upload_result["reason"])
+    manifest["artifact_upload"] = upload_result
+
     write_json(project_path("artifacts/training/training_manifest.json"), manifest)
     write_json(final_adapter_dir / "training_manifest.json", manifest)
     logger.info("Training manifest written; total duration %.1fs", manifest["duration_seconds"])

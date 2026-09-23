@@ -36,7 +36,8 @@ def main() -> int:
                 "frontend/nginx.conf", "configs/train.yaml", "configs/eval.yaml",
                 "configs/app.yaml", "notebooks/DocuTune_Training.ipynb",
                 ".github/workflows/test.yml", "docs/MODEL_CARD.md", "docs/DATASET.md",
-                "docs/EVALUATION.md", "docs/TRAINING.md", "docs/DEPLOYMENT.md"):
+                "docs/EVALUATION.md", "docs/TRAINING.md", "docs/DEPLOYMENT.md",
+                "docs/KAGGLE.md"):
         check_file(rel)
 
     # --- Package imports (torch-free core) ---

@@ -129,7 +129,8 @@ Canonical structured records are generated first, then rendered into messy text 
 - **Config:** `r=16, alpha=32, dropout=0.05`, 3 epochs, LR 2e-4, effective batch 16 (2 × 8 accumulation), max_length 2048, warmup_ratio 0.05 (→ warmup_steps computed automatically) — all in `configs/train.yaml`.
 - **Loss:** completion-only — prompt tokens are masked to `-100`; the model learns only the target JSON.
 - **Output:** a LoRA adapter (`artifacts/adapters/final`), a tokenizer copy, a resolved config, a loss history and a full training manifest with real versions (model revision, CUDA/GPU info, library versions, timing). See [`docs/TRAINING.md`](docs/TRAINING.md).
-- **Checkpointing:** `--resume` / `--checkpoint` recover interrupted Colab runs from the latest checkpoint.
+- **Checkpointing & recovery:** checkpoints every 25 optimizer steps under `artifacts/training/`; `--resume` continues from the latest **valid** checkpoint (incomplete crash-truncated checkpoints are skipped); `--checkpoint <path>` validates an explicit resume point.
+- **Remote-run persistence (optional):** set `DOCUTUNE_HF_REPO_ID` (+ `DOCUTUNE_HF_TOKEN`, or `HF_TOKEN`) and the trainer verifies the saved adapter and uploads it — with its training manifest and resolved config — to a **private** Hugging Face repo after training. Disabled by default; local training needs no HF authentication; failed uploads are reported honestly and never touch the local adapter. See [docs/KAGGLE.md](docs/KAGGLE.md) for the full Kaggle workflow.
 
 ## Evaluation
 
@@ -205,7 +206,7 @@ DocuTune/
 │                          check_environment · verify_project
 ├── tests/                 GPU-free pytest suite (mocked models, stub tokenizer)
 ├── notebooks/             DocuTune_Training.ipynb (Colab)
-├── docs/                  MODEL_CARD · DATASET · EVALUATION · TRAINING · DEPLOYMENT
+├── docs/                  MODEL_CARD · DATASET · EVALUATION · TRAINING · DEPLOYMENT · KAGGLE
 ├── artifacts/             adapters/final (from Colab) · training/  [not committed]
 └── results/               benchmark outputs, charts, reports    [generated]
 ```
