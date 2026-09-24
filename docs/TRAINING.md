@@ -134,48 +134,91 @@ and RNG state — everything needed to continue optimizer/scheduler/model/Traine
 state exactly where the run stopped. For the reference 87-step run (~6 h 20 m on
 a P100) that is a checkpoint roughly every 1 h 48 m: worst-case loss on a
 disconnect stays under two hours while retained storage stays around a few
-hundred MB. Checkpoints live under the **training output dir** and are never
-mixed with the final adapter directory.
+hundred MB (~115 MB per checkpoint: fp32 adapter weights + fp32 AdamW moments +
+<1 MB state files — the frozen 4-bit base model is never stored). Checkpoints
+live under the **training output dir** and are never mixed with the final
+adapter directory.
 
-**Resume.**
+**Remote checkpoint mirroring (durable across runtime resets).** Local
+checkpoints die with an ephemeral runtime (Kaggle/Colab). When
+`DOCUTUNE_HF_REPO_ID` is set, every checkpoint is additionally mirrored to the
+private Hub repo (`docutune/training/remote_persistence.py`) the moment Trainer
+writes it:
+
+- upload = **one atomic Hub commit** per checkpoint (all files + a
+  `REMOTE_CHECKPOINT_COMPLETE.json` marker with per-file sizes + sha256), under
+  `checkpoints/checkpoint-<step>/` — an interrupted upload can never leave a
+  selectable half-written checkpoint;
+- a checkpoint counts as persisted only after the commit landed AND the marker +
+  files were verified remotely; success is never reported falsely;
+- upload failures are retried up to 3 times with bounded exponential backoff,
+  then reported honestly in the log and manifest — the local checkpoint is
+  never touched and training never aborts;
+- each step has its own remote directory (no overwrites between checkpoints);
+  full base-model weight files are refused outright (QLoRA checkpoints must
+  contain adapter state only).
+
+**Resume precedence** (`docutune/training/remote_persistence.py::resolve_resume_checkpoint`,
+documented in code and enforced by tests):
+
+1. `--checkpoint <path>` — strict: an invalid path **fails loudly**;
+2. `--resume` + latest **valid local** checkpoint in the output dir (skipping
+   crash-truncated directories);
+3. `--resume` + latest **valid remote** checkpoint — only when no valid local
+   checkpoint exists (the fresh-runtime case). It is downloaded to a staging
+   dir, hash-verified against the marker, validated with the same
+   `validate_checkpoint_dir` rules, then materialized as a normal local
+   checkpoint. A corrupt newest mirror falls back to the newest valid older
+   one; a config-fingerprint mismatch (different model/hyperparameters) is
+   rejected outright.
+4. Neither exists → fresh training, logged clearly.
+
+Local wins over remote on purpose: on a live runtime the local checkpoint is
+always at least as new as the mirror, and no network is needed. Remote
+discovery/transport failures fail fast at startup (before any model download)
+instead of silently restarting from step 0 while a valid mirror may exist;
+unset `DOCUTUNE_HF_REPO_ID` for local-only resume.
 
 ```bash
 python -m docutune.training.train --config configs/train.yaml --resume
 python -m docutune.training.train --checkpoint artifacts/training/checkpoint-50
 ```
 
-- `--resume` uses `docutune/training/checkpoints.py::find_latest_valid_checkpoint`
-  to select the highest-step checkpoint that is **actually complete**
-  (`trainer_state.json` parseable + `optimizer.pt` + `scheduler.pt` + adapter
-  weights present). A directory killed mid-write is detected and skipped, so a
-  crash can never poison the resume. No valid checkpoint exists → the run
-  starts fresh (logged explicitly), which is the correct behavior on a first run.
-- `--checkpoint <path>` resumes from an explicit directory and **fails loudly**
-  if that directory is not a valid resume point.
-- The checkpoint path actually resumed from is recorded in the training manifest
-  (`resumed_from_checkpoint`).
+The resolved resume point is recorded in the manifest as `resume_source`
+(`local` / `remote` / `scratch`) plus `resumed_from_checkpoint` and
+`resume_checkpoint_step`. Every checkpoint's mirror outcome is recorded in
+`manifest["checkpoint_persistence"]` (step, local path, remote path, repo id,
+`upload_attempted`, `upload_status`, `verified`, sanitized failure reason —
+never credentials).
 
-Kaggle-specific instructions (secrets, upload, both recovery cases):
-[docs/KAGGLE.md](KAGGLE.md).
+Kaggle-specific instructions (secrets, repo setup, recovery cases, manual
+recovery): [docs/KAGGLE.md](KAGGLE.md).
 
-## Optional adapter persistence to the Hugging Face Hub
+## Optional persistence to the Hugging Face Hub (adapter + checkpoints)
 
-On ephemeral runtimes the locally saved adapter dies with the runtime. After
-saving and **verifying** the final adapter, the trainer can upload it to a
-PRIVATE Hub repository. Controlled purely by environment variables:
+On ephemeral runtimes the locally saved adapter AND the local checkpoints die
+with the runtime. Setting `DOCUTUNE_HF_REPO_ID` enables two Hub-backed layers
+in one private repo:
+
+1. **Remote checkpoint mirroring** — during training, every checkpoint is
+   atomically committed to `checkpoints/checkpoint-<step>/` right after it is
+   written (see the previous section; details and recovery in
+   [docs/KAGGLE.md](KAGGLE.md)).
+2. **Final-adapter upload** — after training, the verified adapter is uploaded
+   to the repo root, together with its reproduction metadata
+   (`training_manifest.json`, `resolved_training_config.json`).
+
+Controlled purely by environment variables:
 
 | Variable | Effect |
 |---|---|
-| `DOCUTUNE_HF_REPO_ID` | setting it (e.g. `you/docutune-phi3-adapter`) **enables** auto-upload; unset = upload disabled, fully local training |
+| `DOCUTUNE_HF_REPO_ID` | setting it (e.g. `you/docutune-phi3-adapter`) **enables** checkpoint mirroring + final-adapter upload; unset = everything stays local |
 | `DOCUTUNE_HF_TOKEN` | write-enabled token; falls back to `HF_TOKEN` |
 
 Behavior (`docutune/training/persistence.py`):
 
 - the trainer verifies the saved adapter first (`adapter_config.json`, adapter
   weights, tokenizer files) — an incomplete adapter is **not** uploaded;
-- the upload includes the adapter **plus its reproduction metadata**:
-  `training_manifest.json` and `resolved_training_config.json` live in the same
-  directory and are part of the upload;
 - the repo is created **private** if it does not exist;
 - outcome is logged and recorded in the training manifest
   (`artifact_upload.status`: `disabled` / `succeeded` / `failed`; a smoke test
@@ -214,12 +257,16 @@ No methodology or benchmark parameter was changed for speed.
   + `resolved_training_config.json` (this is what the Docker backend loads)
 - `artifacts/training/` — checkpoints, `training_log.json` (loss history →
   `results/charts/training_loss.png`), `training_manifest.json`
+- the private HF repo (when configured) — mirrors of both: final adapter at the
+  root, `checkpoints/checkpoint-<step>/` mirrors with completion markers
 
 The manifest records **actual** values only: model name/revision, dataset/prompt/schema
 versions, sizes, hyperparameters, LoRA config, quantization, Python/torch/transformers/
 peft/bitsandbytes/accelerate versions, CUDA version, GPU name/memory, start/end time,
-the checkpoint resumed from (if any) and the adapter upload status. No GPU
-information is ever invented; on CPU those fields are null/false.
+the resume outcome (`resume_source`, `resumed_from_checkpoint`,
+`resume_checkpoint_step`), the per-checkpoint persistence records
+(`checkpoint_persistence`) and the adapter upload status. No GPU information is
+ever invented; on CPU those fields are null/false. No credentials are ever stored.
 
 ## Troubleshooting
 
@@ -229,8 +276,10 @@ information is ever invented; on CPU those fields are null/false.
 | `TrainingArguments got an unexpected keyword argument 'warmup_ratio'` | transformers 5.x removed it — fixed in this repo (ratio → `warmup_steps` conversion); update to the latest code |
 | `Quantization requires bitsandbytes` | install training extras or set `quantization.enabled: false` (not QLoRA then) |
 | CUDA OOM | reduce `max_length` or `per_device_train_batch_size`, or increase `gradient_accumulation_steps` |
-| Colab/Kaggle disconnected | re-run with `--resume` (same output dir) — resumes from the latest **valid** checkpoint |
+| Colab/Kaggle disconnected | re-run with `--resume` (same output dir) — resumes from the latest **valid** local checkpoint, or the latest **valid remote mirror** when the local state is gone |
 | `Explicit checkpoint ... is not a valid resume point` | the named checkpoint is incomplete; use `--resume` to auto-discover the latest valid one |
+| `Remote checkpoint discovery failed: ...` | Hub/network problem during startup resume — re-run the cell, or unset `DOCUTUNE_HF_REPO_ID` for local-only resume (see docs/KAGGLE.md) |
+| `Checkpoint N persistence FAILED: ...` | the mirror upload failed (token missing, repo permission, network); the local checkpoint and training are unaffected — fix the cause; the checkpoint is re-uploaded automatically on the next save, or manually with `scripts/push_checkpoints.py` |
 | `Adapter upload FAILED: ...` | see the logged reason (token missing, repo permission, network). The local adapter is intact; fix and re-upload with `scripts/push_adapter.py`, or re-run training |
 | `data/splits/train.jsonl not found` | `python scripts/generate_data.py` first |
 | Adapter missing for serving | copy `artifacts/adapters/final` from the GPU runtime / HF repo; set `ADAPTER_PATH` |

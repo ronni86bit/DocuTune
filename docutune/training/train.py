@@ -28,11 +28,13 @@ from docutune.config import (
     project_path,
 )
 from docutune.seed import set_seeds
-from docutune.training.checkpoints import (
-    find_latest_valid_checkpoint,
-    validate_checkpoint_dir,
-)
 from docutune.training.persistence import persist_adapter, resolve_upload_settings
+from docutune.training.remote_persistence import (
+    RemoteCheckpointCallback,
+    RemoteCheckpointStore,
+    checkpoint_fingerprint,
+    resolve_resume_checkpoint,
+)
 from docutune.training.schedule import compute_total_update_steps, compute_warmup_steps
 from docutune.utils.io import read_jsonl, write_json
 from docutune.utils.logging import get_logger
@@ -45,7 +47,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--config", default="configs/train.yaml", help="Training YAML config")
     parser.add_argument("--output-dir", default=None, help="Override training output dir")
     parser.add_argument("--resume", action="store_true",
-                        help="Resume from the latest checkpoint in the output dir")
+                        help="Resume from the latest valid checkpoint (local first, "
+                             "then the remote mirror when DOCUTUNE_HF_REPO_ID is set)")
     parser.add_argument("--checkpoint", default=None,
                         help="Resume from a specific checkpoint path")
     parser.add_argument("--max-samples", type=int, default=None,
@@ -208,6 +211,24 @@ def run_training(config: TrainConfig, args: argparse.Namespace) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     final_adapter_dir.mkdir(parents=True, exist_ok=True)
 
+    # Persistence settings (environment-only; resolved once, used for BOTH
+    # remote checkpoint mirroring and the final-adapter upload).
+    settings = resolve_upload_settings()
+    store = None
+    if settings.enabled and not args.smoke_test:
+        store = RemoteCheckpointStore(settings.repo_id, settings.token,
+                                      fingerprint=checkpoint_fingerprint(config))
+    # 16a resolve the resume point BEFORE loading the model (fail fast):
+    # explicit --checkpoint > valid local checkpoint > valid remote checkpoint
+    # (mirrored to the Hub) > fresh training.
+    decision = resolve_resume_checkpoint(
+        output_dir,
+        resume=args.resume,
+        explicit_checkpoint=args.checkpoint,
+        store=store,
+    )
+    resume_from = decision.checkpoint_path
+
     tokenizer = load_tokenizer(config.model.name, config.model.revision)  # 3 tokenizer
     max_length = 512 if args.smoke_test else config.training.max_length
 
@@ -247,6 +268,22 @@ def run_training(config: TrainConfig, args: argparse.Namespace) -> Path:
         smoke_test=args.smoke_test,
     )
 
+    # Remote checkpoint mirroring: every checkpoint Trainer writes is uploaded
+    # to the private Hub repo right after it is saved (see docs/KAGGLE.md).
+    # Disabled without DOCUTUNE_HF_REPO_ID and never active in smoke tests.
+    checkpoint_persistence: list[dict[str, Any]] = []
+    callbacks: list[Any] = []
+    if store is not None:
+        callbacks.append(RemoteCheckpointCallback(store, checkpoint_persistence))
+        logger.info(
+            "Remote checkpoint persistence ENABLED -> private repo %s "
+            "(every save_steps=%d steps; local checkpoints always kept)",
+            settings.repo_id, config.training.save_steps,
+        )
+    else:
+        logger.info("Remote checkpoint persistence DISABLED (%s) - checkpoints "
+                    "stay on the local (ephemeral) disk only", settings.reason)
+
     trainer = Trainer(
         model=model,
         args=training_args,
@@ -254,32 +291,10 @@ def run_training(config: TrainConfig, args: argparse.Namespace) -> Path:
         eval_dataset=val_dataset.as_torch_dataset(),
         data_collator=collator,
         processing_class=tokenizer,
+        callbacks=callbacks,
     )
 
-    # 16 train (with checkpoint resume support)
-    resume_from = None
-    if args.checkpoint:
-        explicit = Path(args.checkpoint)
-        valid, problems = validate_checkpoint_dir(explicit)
-        if not valid:
-            raise RuntimeError(
-                f"Explicit checkpoint {explicit} is not a valid resume point: "
-                f"{problems}. Use --resume to auto-discover the latest valid "
-                "checkpoint instead."
-            )
-        resume_from = str(explicit)
-        logger.info("Resuming from explicit checkpoint: %s", resume_from)
-    elif args.resume:
-        latest = find_latest_valid_checkpoint(output_dir)
-        if latest is not None:
-            resume_from = str(latest)
-            logger.info("Resuming from the latest valid checkpoint: %s", resume_from)
-        else:
-            resume_from = None
-            logger.warning(
-                "No valid checkpoint found in %s - training from scratch "
-                "(incomplete checkpoints are ignored)", output_dir,
-            )
+    # 16 train (resume point was resolved before model loading)
     trainer.train(resume_from_checkpoint=resume_from)
 
     # 17 validation evaluation
@@ -342,7 +357,11 @@ def run_training(config: TrainConfig, args: argparse.Namespace) -> Path:
             "use_double_quant": config.quantization.use_double_quant,
         },
         "smoke_test": bool(args.smoke_test),
+        "resume_source": decision.source,
         "resumed_from_checkpoint": resume_from,
+        "resume_checkpoint_step": decision.step,
+        "remote_repo_id": settings.repo_id if settings.enabled else None,
+        "checkpoint_persistence": checkpoint_persistence,
         "device": device,
         **{k: v for k, v in env.items() if k != "device"},
         "eval_metrics": eval_metrics,
@@ -364,7 +383,6 @@ def run_training(config: TrainConfig, args: argparse.Namespace) -> Path:
                          "url": None, "reason": None}
         logger.info("Smoke test - adapter upload skipped")
     else:
-        settings = resolve_upload_settings()
         if not settings.enabled:
             logger.info(
                 "Adapter upload DISABLED (%s). The adapter is saved locally at %s "
