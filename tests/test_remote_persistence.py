@@ -99,8 +99,17 @@ class FakeHubRepo:
         return local_dir
 
 
-def make_store(repo: FakeHubRepo, fingerprint: str = FP) -> RemoteCheckpointStore:
-    return RemoteCheckpointStore(repo.repo_id, TOKEN, fingerprint=fingerprint, api=repo)
+class FakeOperationStore(RemoteCheckpointStore):
+    """Store whose commit operations are plain stubs - mirrors CI, where
+    huggingface_hub is not installed and the real CommitOperationAdd is
+    unavailable."""
+
+    def _make_operation(self, path_in_repo: str, path_or_fileobj):
+        return SimpleNamespace(path_in_repo=path_in_repo, path_or_fileobj=path_or_fileobj)
+
+
+def make_store(repo: FakeHubRepo, fingerprint: str = FP) -> FakeOperationStore:
+    return FakeOperationStore(repo.repo_id, TOKEN, fingerprint=fingerprint, api=repo)
 
 
 def make_local_checkpoint(path: Path, step: int, complete: bool = True) -> Path:

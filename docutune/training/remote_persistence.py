@@ -528,18 +528,26 @@ class RemoteCheckpointStore:
             logger.error("Checkpoint %d persistence FAILED after upload: %s", step, reason)
         return record
 
+    def _make_operation(self, path_in_repo: str, path_or_fileobj: Any) -> Any:
+        """One Hub commit operation. A hook so the whole upload path stays
+        unit-testable without huggingface_hub installed (CI has no network
+        stack and no Hub client)."""
+        from huggingface_hub import CommitOperationAdd
+
+        return CommitOperationAdd(path_in_repo=path_in_repo,
+                                  path_or_fileobj=path_or_fileobj)
+
     def _build_operations(
         self, checkpoint_dir: Path, files: list[Path], marker: dict[str, Any], step: int
     ) -> list[Any]:
-        from huggingface_hub import CommitOperationAdd
-
         prefix = remote_checkpoint_prefix(step)
         operations = [
-            CommitOperationAdd(path_in_repo=f"{prefix}/{p.relative_to(checkpoint_dir).as_posix()}",
-                               path_or_fileobj=str(p))
+            self._make_operation(
+                path_in_repo=f"{prefix}/{p.relative_to(checkpoint_dir).as_posix()}",
+                path_or_fileobj=str(p))
             for p in files
         ]
-        operations.append(CommitOperationAdd(
+        operations.append(self._make_operation(
             path_in_repo=f"{prefix}/{REMOTE_CHECKPOINT_MARKER}",
             path_or_fileobj=json.dumps(marker, indent=2).encode("utf-8"),
         ))
